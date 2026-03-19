@@ -1,177 +1,323 @@
 #!/bin/bash
+# ↑ Shebang — говорит системе: запускай через bash
 
-# === Первоначальная настройка сервера ===
-# Безопасность + Docker + базовые утилиты
+# ══════════════════════════════════════════════════
+# server-init.sh — первичная настройка сервера
+# Запускать ТОЛЬКО от root, ТОЛЬКО один раз
+# ══════════════════════════════════════════════════
 
-set -e
+# Цвета для красивого вывода — профи всегда делают
+# читаемый вывод чтобы видеть что происходит
+RED='\033[0;31m'    # красный = ошибка
+GREEN='\033[0;32m'  # зелёный = успех  
+YELLOW='\033[1;33m' # жёлтый = внимание
+NC='\033[0m'        # NC = No Color = сброс цвета
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-CYAN='\033[0;36m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+# Функция вывода — чтобы не писать echo каждый раз
+# Функция в bash = блок кода с именем
+# Вызываешь по имени: log "текст"
+log()  { echo -e "${GREEN}[✓]${NC} $1"; }
+warn() { echo -e "${YELLOW}[!]${NC} $1"; }
+err()  { echo -e "${RED}[✗]${NC} $1"; exit 1; }
+# exit 1 = завершить скрипт с ошибкой
+# $1 = первый аргумент переданный функции
 
-# Проверка root
+# ══════════════════════════════════════════════════
+# ПРОВЕРКА 1: Запущен ли скрипт от root?
+# ══════════════════════════════════════════════════
+# $EUID — специальная переменная bash
+# EUID = Effective User ID
+# root всегда имеет ID = 0
 if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}Запустите скрипт от root!${NC}"
-    exit 1
+    err "Запусти скрипт от root: sudo bash server-init.sh"
 fi
+# [ ] = условие в bash
+# -ne = not equal = не равно
+# Читается: "если ID пользователя НЕ равен 0 — ошибка"
 
-echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║     Настройка сервера с нуля               ║${NC}"
-echo -e "${CYAN}╚════════════════════════════════════════════╝${NC}"
+# ══════════════════════════════════════════════════
+# ПРОВЕРКА 2: Сколько пользователей уже есть?
+# ══════════════════════════════════════════════════
+echo ""
+warn "=== АНАЛИЗ ТЕКУЩЕГО СОСТОЯНИЯ СИСТЕМЫ ==="
 echo ""
 
-# === 1. ОБНОВЛЕНИЕ СИСТЕМЫ ===
-echo -e "${YELLOW}[1/7] Обновление системы...${NC}"
-apt-get update -qq
-apt-get upgrade -y -qq
-echo -e "${GREEN}[OK]${NC}"
+# Показываем пользователей с UID >= 1000
+# Обычные пользователи всегда имеют UID от 1000 и выше
+# Системные пользователи (root, daemon) — ниже 1000
+EXISTING_USERS=$(awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' /etc/passwd)
+# awk = мощная программа для обработки текста
+# -F: = разделитель полей = двоеточие (в /etc/passwd поля через :)
+# $3 = третье поле = UID
+# {print $1} = вывести первое поле = имя пользователя
 
-# === 2. УСТАНОВКА БАЗОВЫХ УТИЛИТ ===
-echo -e "${YELLOW}[2/7] Установка утилит...${NC}"
-apt-get install -y -qq \
-    curl wget git htop nano vim \
-    ufw fail2ban \
-    net-tools iptables-persistent netfilter-persistent \
-    qrencode ca-certificates gnupg lsb-release \
-    unattended-upgrades apt-listchanges
-echo -e "${GREEN}[OK]${NC}"
+USER_COUNT=$(echo "$EXISTING_USERS" | grep -c .)
+# grep -c . = посчитать количество непустых строк
 
-# === 3. НАСТРОЙКА SSH ===
-echo -e "${YELLOW}[3/7] Настройка SSH...${NC}"
+if [ "$USER_COUNT" -gt 0 ]; then
+    warn "Найдено пользователей в системе: $USER_COUNT"
+    echo "  Список: $EXISTING_USERS"
+    echo ""
+    warn "Скрипт уже запускался? Проверь перед продолжением."
+    read -p "Продолжить всё равно? (yes/no): " CONTINUE
+    # read = читать ввод от пользователя
+    # -p = prompt = показать текст перед вводом
+    [ "$CONTINUE" != "yes" ] && err "Отменено пользователем."
+else
+    log "Пользователей нет — чистая система, продолжаем."
+fi
 
-# Бэкап конфига
-cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
+# ══════════════════════════════════════════════════
+# ПРОВЕРКА 3: Настроен ли уже SSH?
+# ══════════════════════════════════════════════════
+CURRENT_SSH_PORT=$(grep "^Port " /etc/ssh/sshd_config | awk '{print $2}')
+# grep "^Port " = найти строку начинающуюся с "Port "
+# ^ = начало строки (в grep)
+# awk '{print $2}' = взять второе слово = номер порта
 
-# Запрос нового SSH порта
-read -p "Новый SSH порт (Enter = оставить 22): " NEW_SSH_PORT
-NEW_SSH_PORT=${NEW_SSH_PORT:-22}
+if [ -n "$CURRENT_SSH_PORT" ] && [ "$CURRENT_SSH_PORT" != "22" ]; then
+    warn "SSH уже настроен на нестандартный порт: $CURRENT_SSH_PORT"
+    warn "Скрипт мог уже запускаться!"
+    read -p "Продолжить? (yes/no): " CONTINUE2
+    [ "$CONTINUE2" != "yes" ] && err "Отменено."
+fi
+# -n = проверить что строка НЕ пустая
 
-# Применение настроек
-cat > /etc/ssh/sshd_config.d/hardening.conf << EOF
-# Порт
-Port $NEW_SSH_PORT
+# ══════════════════════════════════════════════════
+# БЛОК ВОПРОСОВ — собираем всё до начала изменений
+# Профи делают все вопросы ДО изменений — чтобы
+# не прерываться в середине настройки
+# ══════════════════════════════════════════════════
+echo ""
+log "=== СБОР ПАРАМЕТРОВ НАСТРОЙКИ ==="
+echo ""
 
-# Безопасность
-PermitRootLogin yes
-PasswordAuthentication yes
-PubkeyAuthentication yes
-PermitEmptyPasswords no
-X11Forwarding no
-MaxAuthTries 5
-ClientAliveInterval 300
-ClientAliveCountMax 2
+# Вопрос 1: Имя пользователя
+read -p "Имя нового пользователя: " USERNAME
+# Проверяем что не пустое
+[ -z "$USERNAME" ] && err "Имя не может быть пустым!"
+# -z = zero = проверить что строка ПУСТАЯ
+# Читается: "если USERNAME пустой — ошибка"
 
-# Логирование
-LogLevel VERBOSE
-EOF
+# Проверяем что пользователь не существует
+if id "$USERNAME" &>/dev/null; then
+    err "Пользователь $USERNAME уже существует!"
+fi
+# id = показать информацию о пользователе
+# &>/dev/null = выбросить весь вывод (нам важен только результат)
+# если id нашёл пользователя — вернёт код 0 (успех)
+# если не нашёл — вернёт код 1 (ошибка)
 
-echo -e "${GREEN}[OK] SSH порт: $NEW_SSH_PORT${NC}"
+# Вопрос 2: Пароль
+read -s -p "Пароль для $USERNAME: " USER_PASS
+# -s = silent = не показывать что вводишь (для паролей)
+echo "" # перенос строки после скрытого ввода
+read -s -p "Повтори пароль: " USER_PASS2
+echo ""
+[ "$USER_PASS" != "$USER_PASS2" ] && err "Пароли не совпадают!"
+[ ${#USER_PASS} -lt 8 ] && err "Пароль слишком короткий (минимум 8 символов)!"
+# ${#USER_PASS} = длина строки USER_PASS
+# -lt = less than = меньше чем
 
-# === 4. НАСТРОЙКА FIREWALL (UFW) ===
-echo -e "${YELLOW}[4/7] Настройка Firewall...${NC}"
+# Вопрос 3: SSH публичный ключ
+echo ""
+warn "Открой Termius или PuTTY → Key Manager → скопируй PUBLIC ключ"
+warn "Выглядит так: ssh-ed25519 AAAA... или ssh-rsa AAAA..."
+echo ""
+read -p "Вставь публичный SSH ключ: " SSH_KEY
 
-ufw --force reset > /dev/null
+# Проверяем формат ключа
+if [[ ! "$SSH_KEY" =~ ^(ssh-ed25519|ssh-rsa|ssh-ecdsa) ]]; then
+    err "Неверный формат ключа! Должен начинаться с ssh-ed25519 или ssh-rsa"
+fi
+# [[ =~ ]] = проверка по регулярному выражению
+# ^ = начинается с
+# | = или
+
+# Вопрос 4: Новый порт SSH
+echo ""
+warn "Выбери нестандартный порт SSH (например: 2222, 2244, 33022)"
+warn "НЕ используй: 22, 80, 443, 3000, 8080"
+read -p "Новый порт SSH (1024-65535): " SSH_PORT
+
+# Проверяем что порт — число в нужном диапазоне
+if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || \
+   [ "$SSH_PORT" -lt 1024 ] || \
+   [ "$SSH_PORT" -gt 65535 ]; then
+    err "Порт должен быть числом от 1024 до 65535"
+fi
+# ^[0-9]+$ = только цифры от начала до конца строки
+
+# ══════════════════════════════════════════════════
+# ПОКАЗЫВАЕМ ПЛАН — профи всегда показывают что будет
+# сделано ПЕРЕД тем как делать
+# ══════════════════════════════════════════════════
+echo ""
+warn "══════════════════════════════════════════"
+warn "ПЛАН ДЕЙСТВИЙ — проверь перед запуском:"
+warn "══════════════════════════════════════════"
+echo "  Пользователь:  $USERNAME"
+echo "  SSH порт:      $SSH_PORT"
+echo "  SSH ключ:      ${SSH_KEY:0:40}..." # показываем первые 40 символов
+echo ""
+echo "  Будет сделано:"
+echo "  [1] Обновление системы"
+echo "  [2] Установка: curl wget git ufw fail2ban htop nano"
+echo "  [3] Создание пользователя $USERNAME с sudo"
+echo "  [4] Настройка SSH ключа"
+echo "  [5] SSH порт → $SSH_PORT, отключение root и паролей"
+echo "  [6] UFW: разрешить порт $SSH_PORT, заблокировать всё остальное"
+echo "  [7] Настройка fail2ban"
+echo ""
+read -p "Всё верно? Начать настройку? (yes/no): " CONFIRM
+[ "$CONFIRM" != "yes" ] && err "Отменено пользователем."
+
+# ══════════════════════════════════════════════════
+# ПОЕХАЛИ — теперь делаем изменения
+# ══════════════════════════════════════════════════
+
+# 1. Обновление системы
+log "Обновляем систему..."
+export DEBIAN_FRONTEND=noninteractive
+# DEBIAN_FRONTEND=noninteractive = не задавать вопросов при установке
+apt update -qq && apt upgrade -y -qq
+# -qq = quiet quiet = минимум вывода
+log "Система обновлена."
+
+# 2. Установка программ
+log "Устанавливаем необходимые программы..."
+apt install -y -qq curl wget git ufw fail2ban htop nano
+log "Программы установлены."
+
+# 3. Создание пользователя
+log "Создаём пользователя $USERNAME..."
+useradd -m -s /bin/bash "$USERNAME"
+# -m = create home = создать домашнюю папку /home/USERNAME
+# -s /bin/bash = shell = какой терминал использовать
+
+# Устанавливаем пароль программно
+echo "$USERNAME:$USER_PASS" | chpasswd
+# chpasswd = change password = изменить пароль
+# формат: "имя:пароль" передаём через pipe |
+
+# Выдаём sudo права
+usermod -aG sudo "$USERNAME"
+log "Пользователь $USERNAME создан."
+
+# 4. SSH ключ
+log "Настраиваем SSH ключ..."
+mkdir -p /home/$USERNAME/.ssh
+# mkdir -p = создать папку и все родительские если не существуют
+
+echo "$SSH_KEY" > /home/$USERNAME/.ssh/authorized_keys
+# authorized_keys = файл с разрешёнными публичными ключами
+# SSH при подключении проверяет: есть ли твой ключ в этом файле?
+
+chown -R $USERNAME:$USERNAME /home/$USERNAME/.ssh
+# chown = change owner = сменить владельца
+# -R = recursive = рекурсивно (все файлы внутри)
+# USERNAME:USERNAME = владелец:группа
+
+chmod 700 /home/$USERNAME/.ssh
+# 700 = только владелец может читать/писать/входить в папку
+chmod 600 /home/$USERNAME/.ssh/authorized_keys
+# 600 = только владелец может читать и писать файл
+# SSH откажет в доступе если права выставлены неправильно!
+log "SSH ключ настроен."
+
+# 5. Настройка SSH
+log "Настраиваем SSH безопасность..."
+
+# Меняем порт
+sed -i "s/^#*Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
+# sed = stream editor = редактор потока текста
+# -i = in-place = изменить файл напрямую
+# s/ЧТО/НА_ЧТО/ = замена
+# ^#*Port .* = строка начинающаяся с необязательного # и Port
+
+# Запрещаем вход root
+sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+
+# Запрещаем вход по паролю
+sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+
+# Разрешаем вход только нашему пользователю
+echo "AllowUsers $USERNAME" >> /etc/ssh/sshd_config
+# >> = дописать в конец файла (не перезаписать!)
+# > = перезаписать файл (осторожно с этим!)
+
+# Проверяем конфиг перед перезапуском
+# Профи ВСЕГДА проверяют конфиг до перезапуска!
+sshd -t || err "Ошибка в конфиге SSH! Исправь вручную."
+# sshd -t = test = проверить конфиг без запуска
+# || = ИЛИ = если предыдущая команда упала — выполни следующую
+
+systemctl restart ssh
+log "SSH настроен: порт $SSH_PORT, root запрещён, пароли запрещены."
+
+# 6. UFW фаервол
+log "Настраиваем UFW фаервол..."
+ufw --force reset
+# reset = сбросить все правила до заводских
+# --force = не спрашивать подтверждения
+
 ufw default deny incoming
+# deny incoming = по умолчанию блокировать ВСЕ входящие
 ufw default allow outgoing
+# allow outgoing = разрешить ВСЕ исходящие
 
-# SSH
-ufw allow $NEW_SSH_PORT/tcp comment 'SSH'
+ufw allow $SSH_PORT/tcp comment 'SSH'
+# allow = разрешить
+# $SSH_PORT/tcp = порт/протокол
+# comment = подпись для этого правила
 
-# Веб (если нужно)
 ufw allow 80/tcp comment 'HTTP'
 ufw allow 443/tcp comment 'HTTPS'
 
-# Для MTProto прокси
-ufw allow 8443/tcp comment 'MTProto alt'
+ufw --force enable
+log "UFW включён. Открыты порты: $SSH_PORT, 80, 443."
 
-# Включаем UFW
-echo "y" | ufw enable > /dev/null
+# 7. Fail2ban — защита от брутфорса
+log "Настраиваем fail2ban..."
+cat > /etc/fail2ban/jail.local << 'EOF'
+# jail.local — локальные настройки (не перезаписываются при обновлении)
+# << 'EOF' = heredoc = пишем многострочный текст прямо в скрипте
 
-echo -e "${GREEN}[OK] Firewall настроен${NC}"
-ufw status numbered
-
-# === 5. НАСТРОЙКА FAIL2BAN ===
-echo -e "${YELLOW}[5/7] Настройка Fail2Ban...${NC}"
-
-cat > /etc/fail2ban/jail.local << EOF
 [DEFAULT]
-bantime = 3600
-findtime = 600
+# bantime = на сколько блокировать (10 минут)
+bantime  = 10m
+# findtime = за какой период считать попытки
+findtime = 10m
+# maxretry = сколько попыток до блокировки
 maxretry = 5
-ignoreip = 127.0.0.1/8
+# backend для Ubuntu 22.04
+backend = systemd
 
 [sshd]
 enabled = true
-port = $NEW_SSH_PORT
-filter = sshd
-logpath = /var/log/auth.log
-maxretry = 3
-bantime = 3600
+port    = $SSH_PORT
 EOF
 
-systemctl enable fail2ban > /dev/null 2>&1
+systemctl enable fail2ban
 systemctl restart fail2ban
+log "Fail2ban настроен: блокировка после 5 попыток за 10 минут."
 
-echo -e "${GREEN}[OK] Fail2Ban активен${NC}"
-
-# === 6. УСТАНОВКА DOCKER ===
-echo -e "${YELLOW}[6/7] Установка Docker...${NC}"
-
-if ! command -v docker &> /dev/null; then
-    curl -fsSL https://get.docker.com | sh
-    systemctl enable docker
-    systemctl start docker
-    echo -e "${GREEN}[OK] Docker установлен${NC}"
-else
-    echo -e "${GREEN}[OK] Docker уже установлен${NC}"
-fi
-
-# === 7. ОПТИМИЗАЦИЯ СЕТИ ===
-echo -e "${YELLOW}[7/7] Оптимизация сети (BBR)...${NC}"
-
-cat >> /etc/sysctl.conf << 'EOF'
-
-# === Network Optimization ===
-net.ipv4.ip_forward = 1
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_fastopen = 3
-net.core.somaxconn = 65535
-net.ipv4.tcp_max_syn_backlog = 65535
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-EOF
-
-sysctl -p > /dev/null 2>&1
-
-echo -e "${GREEN}[OK] BBR активирован${NC}"
-
-# === ПЕРЕЗАПУСК SSHD ===
-echo ""
-echo -e "${YELLOW}Перезапуск SSH...${NC}"
-systemctl restart sshd
-
-# === ИТОГОВАЯ ИНФОРМАЦИЯ ===
-SERVER_IP=$(curl -s --max-time 5 ifconfig.me || curl -s --max-time 5 api.ipify.org || echo "не определён")
+# ══════════════════════════════════════════════════
+# ИТОГ — показываем что сделано и как подключиться
+# ══════════════════════════════════════════════════
+SERVER_IP=$(curl -s https://ifconfig.me)
+# curl -s = silent = без лишнего вывода
+# ifconfig.me = сервис который возвращает твой IP
 
 echo ""
-echo -e "${GREEN}╔════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║              СЕРВЕР НАСТРОЕН!                              ║${NC}"
-echo -e "${GREEN}╚════════════════════════════════════════════════════════════╝${NC}"
+log "══════════════════════════════════════════"
+log "НАСТРОЙКА ЗАВЕРШЕНА УСПЕШНО!"
+log "══════════════════════════════════════════"
 echo ""
-echo -e "  IP сервера:    ${CYAN}$SERVER_IP${NC}"
-echo -e "  SSH порт:      ${CYAN}$NEW_SSH_PORT${NC}"
-echo -e "  SSH команда:   ${YELLOW}ssh root@$SERVER_IP -p $NEW_SSH_PORT${NC}"
+echo "  Подключение:"
+echo "  ${GREEN}ssh -p $SSH_PORT $USERNAME@$SERVER_IP${NC}"
 echo ""
-echo -e "${YELLOW}Открытые порты:${NC}"
-ufw status | grep -E "^\[" | head -10
-echo ""
-echo -e "${RED}ВАЖНО: Запомни SSH порт $NEW_SSH_PORT !${NC}"
-echo -e "${RED}       Иначе потеряешь доступ к серверу!${NC}"
-echo ""
-echo -e "${CYAN}Следующий шаг — установить прокси скрипты:${NC}"
-echo -e "  MTProto:  ${YELLOW}wget -O mtproxy.sh 'ССЫЛКА' && chmod +x mtproxy.sh && ./mtproxy.sh${NC}"
-echo -e "  Каскад:   ${YELLOW}wget -O kaskad.sh 'ССЫЛКА' && chmod +x kaskad.sh && ./kaskad.sh${NC}"
+warn "  ВАЖНО: НЕ ЗАКРЫВАЙ эту сессию!"
+warn "  Сначала открой НОВОЕ окно и проверь подключение."
+warn "  Только после успешного входа закрывай это окно."
 echo ""
